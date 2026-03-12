@@ -1,6 +1,6 @@
 # pt-timer
 
-A terminal-based interval timer with GO/REST sets.
+A terminal-based interval timer with GO/REST sets.  Used to track my physical therapy isometrics.
 
 ## Installation
 
