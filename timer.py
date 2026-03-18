@@ -17,6 +17,7 @@ RED     = "\033[31m"
 YELLOW  = "\033[33m"
 MAGENTA = "\033[35m"
 WHITE   = "\033[37m"
+CYAN    = "\033[36m"
 
 BOX_W = 38  # inner visible width of the timer box
 
@@ -57,6 +58,11 @@ def fmt_rest_timer(total_s, ms):
     return f"{time_str}  {BOLD}{RED}REST{RESET}"
 
 
+def fmt_paused_timer(total_s, ms):
+    time_str = f"{YELLOW}{total_s}.{ms:03d}{RESET}"
+    return f"{time_str}  {BOLD}{CYAN}PAUSED{RESET}"
+
+
 def fmt_lap(lap, set_num, basic):
     if lap[0] == "go":
         _, lc1, lc2, lt, lms, lcount = lap
@@ -67,7 +73,79 @@ def fmt_lap(lap, set_num, basic):
         return f" {DIM}Rest:  {lt}.{lms:03d}{RESET}"
 
 
-def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
+# ---------------------------------------------------------------------------
+# Voice listener — returns a thread function, or None if unavailable
+# ---------------------------------------------------------------------------
+VOICE_KEYWORDS = {
+    # save current set → same as space
+    "set":      "space",
+    "rest":     "space",
+    "done":     "space",
+    "next":     "space",
+    "stop":     "space",
+    # end rest, start new set → same as space (works in both phases)
+    "start":    "space",
+    "go":       "space",
+    "resume":   "pause",
+    "continue": "pause",
+    # toggle pause
+    "pause":   "pause",
+    "freeze":  "pause",
+    # reset
+    "reset":   "reset",
+    "restart": "reset",
+}
+
+
+def make_voice_thread(space_pressed, pause_event, reset_pressed, stop_event):
+    try:
+        import speech_recognition as sr
+    except ImportError:
+        print("  [voice] SpeechRecognition not installed — run: pip3 install SpeechRecognition pyaudio")
+        return None
+
+    recognizer = sr.Recognizer()
+    recognizer.energy_threshold = 200
+    recognizer.dynamic_energy_threshold = False
+    recognizer.pause_threshold = 0.3        # seconds of silence to end phrase (default 0.8)
+    recognizer.non_speaking_duration = 0.1  # silence padding before/after phrase (default 0.5)
+
+    def listen():
+        try:
+            mic = sr.Microphone()
+        except Exception as e:
+            print(f"  [voice] Microphone unavailable: {e}")
+            return
+
+        while not stop_event.is_set():
+            try:
+                with mic as source:
+                    audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=1.5)
+                text = recognizer.recognize_google(audio).lower()
+                for kw, action in VOICE_KEYWORDS.items():
+                    if kw in text:
+                        if action == "space":
+                            space_pressed.set()
+                        elif action == "pause":
+                            pause_event.set()
+                        elif action == "reset":
+                            reset_pressed.set()
+                        break
+            except sr.WaitTimeoutError:
+                pass
+            except sr.UnknownValueError:
+                pass
+            except Exception:
+                pass
+
+    return listen
+
+
+# ---------------------------------------------------------------------------
+# Main timer
+# ---------------------------------------------------------------------------
+def run_timer(first_interval, second_interval, countdown_secs: int = 3,
+              voice: bool = False) -> None:
     basic = first_interval is None
     laps = []
     phase = "go"   # "go" or "rest"
@@ -78,9 +156,15 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
     prev_line_count = 0
     countdown_val = None
 
+    # pause state
+    paused = False
+    paused_at = 0.0
+    total_pause_duration = 0.0
+
     space_pressed = threading.Event()
     reset_pressed = threading.Event()
-    stop_event = threading.Event()
+    pause_event   = threading.Event()
+    stop_event    = threading.Event()
 
     def read_keys():
         fd = sys.stdin.fileno()
@@ -95,11 +179,19 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
                         space_pressed.set()
                     elif ch == 'r':
                         reset_pressed.set()
+                    elif ch == 'p':
+                        pause_event.set()
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     key_thread = threading.Thread(target=read_keys, daemon=True)
     key_thread.start()
+
+    if voice:
+        voice_fn = make_voice_thread(space_pressed, pause_event, reset_pressed, stop_event)
+        if voice_fn:
+            voice_thread = threading.Thread(target=voice_fn, daemon=True)
+            voice_thread.start()
 
     sys.stdout.write("\033[?25l")  # hide cursor
 
@@ -113,6 +205,8 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
             lines.append(fmt_lap(lap, set_num, basic))
         if countdown_val is not None:
             lines += box(f"{BOLD}{YELLOW}Starting in {countdown_val}...{RESET}")
+        elif paused:
+            lines += box(fmt_paused_timer(total, ms))
         elif phase == "go":
             if basic:
                 lines += box(fmt_basic_timer(total, ms))
@@ -130,6 +224,7 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
 
     def do_reset():
         nonlocal c1, c2, total, ms, active, c1_count, phase, prev_line_count
+        nonlocal paused, paused_at, total_pause_duration
         if prev_line_count > 0:
             sys.stdout.write(f"\033[{prev_line_count}A\033[J")
         laps.clear()
@@ -138,6 +233,9 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
         c1_count = 0
         phase = "go"
         prev_line_count = 0
+        paused = False
+        paused_at = 0.0
+        total_pause_duration = 0.0
 
     def do_countdown() -> bool:
         """Countdown before GO phase. Returns False if reset triggered."""
@@ -166,9 +264,11 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
         while True:
             time.sleep(0.033)
 
+            # --- reset ---
             if reset_pressed.is_set():
                 reset_pressed.clear()
                 space_pressed.clear()
+                pause_event.clear()
                 do_reset()
                 draw()
                 if not do_countdown():
@@ -177,7 +277,23 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
                 last_second = 0
                 continue
 
-            elapsed = time.monotonic() - start
+            # --- pause toggle ---
+            if pause_event.is_set():
+                pause_event.clear()
+                if not paused:
+                    paused = True
+                    paused_at = time.monotonic()
+                else:
+                    total_pause_duration += time.monotonic() - paused_at
+                    paused = False
+                draw()
+                continue
+
+            if paused:
+                draw()
+                continue
+
+            elapsed = time.monotonic() - start - total_pause_duration
             current_second = int(elapsed)
             ms = int((elapsed % 1) * 1000)
 
@@ -212,6 +328,7 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
                     active = "c1"
                     c1_count = 0
                     phase = "rest"
+                    total_pause_duration = 0.0
                     draw()
                     # no countdown for rest — starts immediately
                 else:
@@ -220,6 +337,7 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3) -> None:
                     active = "c1"
                     c1_count = 0
                     phase = "go"
+                    total_pause_duration = 0.0
                     draw()
                     if not do_countdown():
                         continue
@@ -245,7 +363,7 @@ def main() -> None:
 MODES
   Basic mode       pt-timer
     Tracks elapsed time only. GO label always visible.
-    Use spacebar to save a set and start a REST period.
+    Use spacebar (or voice) to save a set and start a REST period.
 
   Interval mode    pt-timer <first> <second>
     Tracks two nested intervals within each GO set.
@@ -255,9 +373,9 @@ MODES
 
 HOW THE TIMER WORKS
   Each session alternates between GO and REST sets:
-    GO set   — timer runs with full display, ends when you press space
-    REST set — simple elapsed time, ends when you press space
-               then a 2-second countdown before the next GO set begins
+    GO set   — timer runs with full display, ends when you press space (or say "set"/"rest"/"done")
+    REST set — simple elapsed time, ends when you press space (or say "start"/"go"/"resume")
+               then a countdown before the next GO set begins
 
   In interval mode the GO set display shows:
     c1.ms, c2.ms, total.ms   reps: N   GO/STOP
@@ -265,9 +383,17 @@ HOW THE TIMER WORKS
     then they repeat. Reps increments each time c1 completes.
 
 CONTROLS
-  space   save current set, switch to REST (or back to GO with countdown)
-  r       reset everything and restart from the beginning
-  Ctrl+C  quit
+  space        save current set, switch to REST (or back to GO with countdown)
+  p            pause / resume timer
+  r            reset everything and restart from the beginning
+  Ctrl+C       quit
+
+VOICE COMMANDS  (on by default, disable with --no-voice)
+  "set" / "rest" / "done" / "next" / "stop"     save set (same as space)
+  "start" / "go"                                 end rest / start set (same as space)
+  "resume" / "continue"                          unpause
+  "pause" / "freeze"                    pause or resume
+  "reset" / "restart"                   reset everything
 """
     )
     parser.add_argument("first", type=int, nargs="?", default=None,
@@ -275,15 +401,17 @@ CONTROLS
     parser.add_argument("second", type=int, nargs="?", default=None,
                         help="Seconds for the STOP (c2) interval")
     parser.add_argument("--countdown", "-c", type=int, default=3, metavar="N",
-                        help="Countdown seconds before each GO set (default: 2)")
+                        help="Countdown seconds before each GO set (default: 3)")
+    parser.add_argument("--no-voice", action="store_true",
+                        help="Disable voice command recognition")
     args = parser.parse_args()
 
     if args.first is not None:
         print(f"first={args.first}  second={args.second}  "
-              f"(space=set, r=reset, Ctrl+C to stop)\n")
+              f"(space=set, p=pause, r=reset, Ctrl+C to stop)\n")
     else:
-        print("basic mode  (space=set, r=reset, Ctrl+C to stop)\n")
-    run_timer(args.first, args.second, args.countdown)
+        print("basic mode  (space=set, p=pause, r=reset, Ctrl+C to stop)\n")
+    run_timer(args.first, args.second, args.countdown, voice=not args.no_voice)
 
 
 if __name__ == "__main__":

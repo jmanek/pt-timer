@@ -9,6 +9,13 @@ chmod +x timer.py
 ln -sf $(pwd)/timer.py ~/.local/bin/pt-timer
 ```
 
+Dependencies (voice recognition, on by default):
+
+```bash
+brew install portaudio
+pip3 install SpeechRecognition pyaudio
+```
+
 ## Usage
 
 ```bash
@@ -18,7 +25,7 @@ pt-timer -h                 # full help
 ```
 
 ### Basic mode
-Tracks elapsed time only. GO label always visible. Press space to save a set and start a REST period.
+Tracks elapsed time only. GO label always visible. Press space (or say a command) to save a set and start a REST period.
 
 ### Interval mode
 ```bash
@@ -35,14 +42,28 @@ Reps are counted each time c1 completes a full cycle.
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--countdown`, `-c` | Countdown seconds before each GO set | `3` |
+| `--no-voice` | Disable voice command recognition | — |
 
 ## Controls
 
 | Key | Action |
 |-----|--------|
 | `space` | Save current set, switch to REST (or back to GO) |
+| `p` | Pause / resume |
 | `r` | Reset everything |
 | `Ctrl+C` | Quit |
+
+## Voice Commands
+
+Voice recognition is on by default. Commands are sent to Google Speech Recognition, so an internet connection is required.
+
+| Command | Action |
+|---------|--------|
+| `set` / `rest` / `done` / `next` / `stop` | Save current set |
+| `start` / `go` | End REST, start next GO set |
+| `pause` / `freeze` | Pause timer |
+| `resume` / `continue` | Resume from pause |
+| `reset` / `restart` | Reset everything |
 
 ## How it works
 
