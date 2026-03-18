@@ -121,9 +121,9 @@ def make_voice_thread(space_pressed, pause_event, reset_pressed, stop_event):
             try:
                 with mic as source:
                     audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=1.5)
-                text = recognizer.recognize_google(audio).lower()
+                words = set(recognizer.recognize_google(audio).lower().split())
                 for kw, action in VOICE_KEYWORDS.items():
-                    if kw in text:
+                    if kw in words:
                         if action == "space":
                             space_pressed.set()
                         elif action == "pause":
