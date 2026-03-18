@@ -99,44 +99,54 @@ VOICE_KEYWORDS = {
 
 def make_voice_thread(space_pressed, pause_event, reset_pressed, stop_event):
     try:
-        import speech_recognition as sr
+        import vosk
+        import pyaudio
+        import json
     except ImportError:
-        print("  [voice] SpeechRecognition not installed — run: pip3 install SpeechRecognition pyaudio")
+        print("  [voice] vosk not installed — run: pip install vosk pyaudio")
         return None
 
-    recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 200
-    recognizer.dynamic_energy_threshold = False
-    recognizer.pause_threshold = 0.3        # seconds of silence to end phrase (default 0.8)
-    recognizer.non_speaking_duration = 0.1  # silence padding before/after phrase (default 0.5)
+    vosk.SetLogLevel(-1)
+
+    try:
+        model = vosk.Model(lang="en-us")
+    except Exception as e:
+        print(f"  [voice] Failed to load Vosk model: {e}")
+        return None
+
+    grammar = json.dumps(list(VOICE_KEYWORDS.keys()))
 
     def listen():
         try:
-            mic = sr.Microphone()
+            pa = pyaudio.PyAudio()
+            stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                             input=True, frames_per_buffer=4096)
         except Exception as e:
             print(f"  [voice] Microphone unavailable: {e}")
             return
 
-        while not stop_event.is_set():
-            try:
-                with mic as source:
-                    audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=1.5)
-                words = set(recognizer.recognize_google(audio).lower().split())
-                for kw, action in VOICE_KEYWORDS.items():
-                    if kw in words:
-                        if action == "space":
-                            space_pressed.set()
-                        elif action == "pause":
-                            pause_event.set()
-                        elif action == "reset":
-                            reset_pressed.set()
-                        break
-            except sr.WaitTimeoutError:
-                pass
-            except sr.UnknownValueError:
-                pass
-            except Exception:
-                pass
+        import json as _json
+        rec = vosk.KaldiRecognizer(model, 16000, grammar)
+
+        try:
+            while not stop_event.is_set():
+                data = stream.read(4096, exception_on_overflow=False)
+                if rec.AcceptWaveform(data):
+                    text = _json.loads(rec.Result()).get("text", "")
+                    words = set(text.lower().split())
+                    for kw, action in VOICE_KEYWORDS.items():
+                        if kw in words:
+                            if action == "space":
+                                space_pressed.set()
+                            elif action == "pause":
+                                pause_event.set()
+                            elif action == "reset":
+                                reset_pressed.set()
+                            break
+        finally:
+            stream.stop_stream()
+            stream.close()
+            pa.terminate()
 
     return listen
 

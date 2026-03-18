@@ -13,8 +13,10 @@ Dependencies (voice recognition, on by default):
 
 ```bash
 brew install portaudio
-pip3 install SpeechRecognition pyaudio
+pip install vosk pyaudio
 ```
+
+Vosk will automatically download the `vosk-model-small-en-us` model (~40MB) on first run and cache it in `~/.cache/vosk/`. No internet connection required after that.
 
 ## Usage
 
@@ -55,7 +57,7 @@ Reps are counted each time c1 completes a full cycle.
 
 ## Voice Commands
 
-Voice recognition is on by default. Commands are sent to Google Speech Recognition, so an internet connection is required.
+Voice recognition is on by default, powered by [Vosk](https://alphacephei.com/vosk/) running fully offline. Recognition is constrained to only the command vocabulary, which reduces false positives from background noise.
 
 | Command | Action |
 |---------|--------|
