@@ -7,6 +7,8 @@ import termios
 import tty
 import select
 import threading
+import math
+import struct
 
 # ANSI helpers
 RESET   = "\033[0m"
@@ -71,6 +73,79 @@ def fmt_lap(lap, set_num, basic):
     else:
         _, lt, lms = lap
         return f" {DIM}Rest:  {lt}.{lms:03d}{RESET}"
+
+
+# ---------------------------------------------------------------------------
+# Sound — low-latency tones via pyaudio callback mode
+# PortAudio calls _audio_callback from a high-priority C thread every
+# ~6 ms, so beep() → audible output latency is at most one callback period.
+# ---------------------------------------------------------------------------
+_SAMPLE_RATE     = 22050
+_CALLBACK_FRAMES = 128      # 128 / 22050 ≈ 5.8 ms per callback
+_sound_enabled   = True
+_pending_lock    = threading.Lock()
+_pending_bytes   = b""      # raw int16 PCM waiting to be consumed by callback
+
+
+def _make_tone(freq: float, duration: float, volume: float = 0.45) -> bytes:
+    n = int(_SAMPLE_RATE * duration)
+    fade = max(1, int(n * 0.15))
+    samples = []
+    for i in range(n):
+        t = i / _SAMPLE_RATE
+        env = min(1.0, (n - i) / fade)
+        samples.append(int(math.sin(2 * math.pi * freq * t) * env * volume * 32767))
+    return struct.pack(f"{n}h", *samples)
+
+
+_TONES = {
+    "go":   _make_tone(880, 0.12),  # bright high ping  — c2→c1, countdown end
+    "stop": _make_tone(370, 0.10),  # low thud          — c1→c2
+    "save": _make_tone(600, 0.08),  # mid pop           — set saved
+}
+
+
+def beep(kind: str = "go") -> None:
+    global _pending_bytes
+    if not _sound_enabled:
+        return
+    data = _TONES.get(kind)
+    if data:
+        with _pending_lock:
+            _pending_bytes = data
+
+
+def _audio_callback(in_data, frame_count, time_info, status):
+    """Called by PortAudio from its real-time thread every ~6 ms."""
+    global _pending_bytes
+    need = frame_count * 2  # int16 = 2 bytes per sample
+    with _pending_lock:
+        chunk = _pending_bytes[:need]
+        _pending_bytes = _pending_bytes[need:]
+    if len(chunk) < need:
+        chunk += b"\x00" * (need - len(chunk))
+    return (chunk, 0)  # 0 = paContinue
+
+
+def _audio_worker(stop_event: threading.Event) -> None:
+    try:
+        import pyaudio
+    except ImportError:
+        return
+    try:
+        pa = pyaudio.PyAudio()
+        stream = pa.open(
+            format=pyaudio.paInt16, channels=1, rate=_SAMPLE_RATE,
+            output=True, frames_per_buffer=_CALLBACK_FRAMES,
+            stream_callback=_audio_callback,
+        )
+        stream.start_stream()
+        stop_event.wait()
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +230,9 @@ def make_voice_thread(space_pressed, pause_event, reset_pressed, stop_event):
 # Main timer
 # ---------------------------------------------------------------------------
 def run_timer(first_interval, second_interval, countdown_secs: int = 3,
-              voice: bool = False) -> None:
+              voice: bool = False, sound: bool = True) -> None:
+    global _sound_enabled
+    _sound_enabled = sound
     basic = first_interval is None
     laps = []
     phase = "go"   # "go" or "rest"
@@ -196,6 +273,10 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3,
 
     key_thread = threading.Thread(target=read_keys, daemon=True)
     key_thread.start()
+
+    if sound:
+        audio_thread = threading.Thread(target=_audio_worker, args=(stop_event,), daemon=True)
+        audio_thread.start()
 
     if voice:
         voice_fn = make_voice_thread(space_pressed, pause_event, reset_pressed, stop_event)
@@ -261,6 +342,7 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3,
                     return False
         countdown_val = None
         space_pressed.clear()
+        beep("go")
         return True
 
     draw()
@@ -321,17 +403,20 @@ def run_timer(first_interval, second_interval, countdown_secs: int = 3,
                                 c2 = 0
                                 active = "c2"
                                 c1_count += 1
+                                beep("stop")
                         else:
                             c2 += 1
                             if c2 >= second_interval:
                                 c2 = 0
                                 c1 = 0
                                 active = "c1"
+                                beep("go")
             else:
                 total = current_second
 
             if space_pressed.is_set():
                 space_pressed.clear()
+                beep("save")
                 if phase == "go":
                     laps.append(("go", c1, c2, total, ms, c1_count))
                     c1, c2, total, ms = 0, 0, 0, 0
@@ -414,6 +499,8 @@ VOICE COMMANDS  (on by default, disable with --no-voice)
                         help="Countdown seconds before each GO set (default: 3)")
     parser.add_argument("--no-voice", action="store_true",
                         help="Disable voice command recognition")
+    parser.add_argument("--no-sound", action="store_true",
+                        help="Disable sound effects")
     args = parser.parse_args()
 
     if args.first is not None:
@@ -421,7 +508,8 @@ VOICE COMMANDS  (on by default, disable with --no-voice)
               f"(space=set, p=pause, r=reset, Ctrl+C to stop)\n")
     else:
         print("basic mode  (space=set, p=pause, r=reset, Ctrl+C to stop)\n")
-    run_timer(args.first, args.second, args.countdown, voice=not args.no_voice)
+    run_timer(args.first, args.second, args.countdown,
+              voice=not args.no_voice, sound=not args.no_sound)
 
 
 if __name__ == "__main__":
